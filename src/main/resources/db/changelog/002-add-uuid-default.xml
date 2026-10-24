@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <changeSet id="2" author="dev">
+        <comment>Add default UUID generation for players.id</comment>
+
+        <!-- Для PostgreSQL 13+ используем встроенную функцию gen_random_uuid() -->
+        <modifyDataType tableName="players" columnName="id" newDataType="uuid"/>
+
+        <addDefaultValue
+                tableName="players"
+                columnName="id"
+                defaultValueComputed="gen_random_uuid()"/>
+    </changeSet>
+</databaseChangeLog>

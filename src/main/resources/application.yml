@@ -1,0 +1,34 @@
+spring:
+  application:
+    name: brutal-racing-server
+
+  # R2DBC Configuration (Reactive Database Connection)
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/brutal_racing
+    username: postgres
+    password: postgres
+
+  # Liquibase Configuration (Database Migrations)
+  liquibase:
+    url: jdbc:postgresql://localhost:5432/brutal_racing
+    user: postgres
+    password: postgres
+    change-log: classpath:db/changelog/db.changelog-master.xml
+    enabled: true
+
+# Server Configuration
+server:
+  port: 8080
+  error:
+    include-message: always
+
+# JWT Configuration
+jwt:
+  secret: your-super-secret-key-for-brutal-racing-game-must-be-at-least-256-bits-long
+  expiration: 86400000  # 24 hours in milliseconds
+
+# Logging
+logging:
+  level:
+    com.brutalracing: DEBUG
+    org.springframework.web: INFO
