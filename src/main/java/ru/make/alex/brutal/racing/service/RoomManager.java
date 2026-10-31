@@ -9,23 +9,24 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 public class RoomManager {
+
     private final Map<String, GameRoom> rooms = new ConcurrentHashMap<>();
 
-    public GameRoom getOrCreateRoom(String roomId) {
-        return rooms.computeIfAbsent(roomId, GameRoom::new);
+    public GameRoom getRoom(String roomId) {
+        return rooms.get(roomId);
     }
 
-    public GameRoom createPrivateRoom() {
+    public GameRoom createRoom(String creatorId) {
         String roomId = UUID.randomUUID().toString();
-        GameRoom room = new GameRoom(roomId);
+        GameRoom room = new GameRoom(roomId, creatorId);
         rooms.put(roomId, room);
         return room;
     }
 
-    public GameRoom findAvailableRoom() {
+    public GameRoom findAvailableRoom(String playerId) {
         return rooms.values().stream()
-                .filter(room -> !room.isFull())
+                .filter(room -> !room.isFull() && room.getPhase() == GameRoom.GamePhase.WAITING)
                 .findFirst()
-                .orElseGet(this::createPrivateRoom);
+                .orElseGet(() -> createRoom(playerId));
     }
 }

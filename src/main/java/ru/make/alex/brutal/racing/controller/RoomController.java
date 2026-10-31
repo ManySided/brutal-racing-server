@@ -1,33 +1,47 @@
 package ru.make.alex.brutal.racing.controller;
 
-import org.springframework.web.bind.annotation.CrossOrigin;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.HttpHeaders;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
 import ru.make.alex.brutal.racing.engine.GameRoom;
+import ru.make.alex.brutal.racing.security.JwtService;
 import ru.make.alex.brutal.racing.service.RoomManager;
 
 import java.util.Map;
 
 @RestController
 @RequestMapping("/api/rooms")
-@CrossOrigin(origins = "*")
 public class RoomController {
-    private final RoomManager roomManager;
 
-    public RoomController(RoomManager roomManager) {
+    private final RoomManager roomManager;
+    private final JwtService jwtService;
+
+    public RoomController(RoomManager roomManager, JwtService jwtService) {
         this.roomManager = roomManager;
+        this.jwtService = jwtService;
     }
 
     @PostMapping("/create")
-    public Map<String, String> createRoom() {
-        GameRoom room = roomManager.createPrivateRoom();
-        return Map.of("roomId", room.toString());
+    public Mono<Map<String, String>> createRoom(@RequestHeader(HttpHeaders.AUTHORIZATION) String auth) {
+        return resolvePlayerId(auth).map(playerId -> {
+            GameRoom room = roomManager.createRoom(playerId);
+            return Map.of("roomId", room.getRoomId());
+        });
     }
 
     @PostMapping("/find")
-    public Map<String, String> findRoom() {
-        GameRoom room = roomManager.findAvailableRoom();
-        return Map.of("roomId", room.getRoomId());
+    public Mono<Map<String, String>> findRoom(@RequestHeader(HttpHeaders.AUTHORIZATION) String auth) {
+        return resolvePlayerId(auth).map(playerId -> {
+            GameRoom room = roomManager.findAvailableRoom(playerId);
+            return Map.of("roomId", room.getRoomId());
+        });
+    }
+
+    private Mono<String> resolvePlayerId(String auth) {
+        String token = auth != null && auth.startsWith("Bearer ") ? auth.substring(7) : "";
+        String playerId = jwtService.validateTokenAndGetPlayerId(token);
+        return playerId != null
+                ? Mono.just(playerId)
+                : Mono.error(new RuntimeException("Unauthorized"));
     }
 }

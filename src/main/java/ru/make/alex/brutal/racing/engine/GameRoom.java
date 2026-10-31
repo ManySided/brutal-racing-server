@@ -13,7 +13,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 @Getter
 public class GameRoom {
+
+    public enum GamePhase {
+        WAITING, COUNTDOWN, RACING, FINISHED
+    }
+
     private final String roomId;
+    private final String creatorId;
     private final Map<String, PlayerState> players = new ConcurrentHashMap<>();
     private final List<TrackEvent> track;
     private final List<Rocket> rockets = Collections.synchronizedList(new ArrayList<>());
@@ -21,59 +27,133 @@ public class GameRoom {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private Disposable gameLoop;
-    private boolean isRunning = false;
+    private GamePhase phase = GamePhase.WAITING;
+    private int countdown = 5;
     private final AtomicInteger currentTick = new AtomicInteger(0);
 
-    public GameRoom(String roomId) {
+    private static final int MAX_PLAYERS = 4;
+    private static final int MIN_PLAYERS_TO_START = 2;
+    private static final double MAX_RPM = 100.0;
+    private static final double ENGINE_EXPLODE_RPM = 95.0;
+
+    private String lastLobbyState = "{}";
+
+    public GameRoom(String roomId, String creatorId) {
         this.roomId = roomId;
+        this.creatorId = creatorId;
         this.track = TrackGenerator.generateTrack();
     }
 
-    public void addPlayer(String playerId) {
-        players.put(playerId, new PlayerState(playerId));
+    public int getPlayerCount() {
+        return players.size();
+    }
+
+    public boolean isFull() {
+        return players.size() >= MAX_PLAYERS;
+    }
+
+    public void addPlayer(String playerId, String login) {
+        if (players.size() < MAX_PLAYERS && phase == GamePhase.WAITING) {
+            players.put(playerId, new PlayerState(playerId, login));
+            broadcastLobbyState();
+        }
     }
 
     public void removePlayer(String playerId) {
         PlayerState p = players.get(playerId);
         if (p != null) {
-            p.isAlive = false; // Дисконнект = смерть
+            p.isAlive = false;
+            players.remove(playerId);
+            broadcastLobbyState();
         }
     }
 
-    public void startGame() {
-        if (isRunning) return;
-        isRunning = true;
+    public void setPlayerReady(String playerId, boolean ready) {
+        PlayerState p = players.get(playerId);
+        if (p != null && phase == GamePhase.WAITING) {
+            p.isReady = ready;
+            broadcastLobbyState();
+        }
+    }
 
-        // 30 FPS (тиков в секунду)
+    public void startCountdown() {
+        if (phase != GamePhase.WAITING) return;
+        if (players.size() < MIN_PLAYERS_TO_START) return;
+
+        boolean allReady = players.values().stream().allMatch(p -> p.isReady);
+        if (!allReady) return;
+
+        phase = GamePhase.COUNTDOWN;
+        countdown = 5;
+
+        gameLoop = Flux.interval(Duration.ofSeconds(1))
+                .subscribe(tick -> {
+                    if (countdown > 0) {
+                        broadcastCountdown();
+                        countdown--;
+                    } else {
+                        phase = GamePhase.RACING;
+                        startRace();
+                    }
+                });
+    }
+
+    private void startRace() {
+        if (gameLoop != null) gameLoop.dispose();
+
         gameLoop = Flux.interval(Duration.ofMillis(33))
                 .subscribe(tick -> {
                     updatePhysics();
-                    broadcastState();
+                    broadcastRaceState();
                 });
     }
 
     private void updatePhysics() {
         int tick = currentTick.incrementAndGet();
 
-        // Обновляем ракеты
         rockets.removeIf(Rocket::isExploded);
         rockets.forEach(Rocket::update);
 
-        // Обновляем игроков
         for (PlayerState player : players.values()) {
             if (!player.isAlive) continue;
 
-            // Физика ускорения
-            double accel = 0.5;
-            if (player.rpm > 30 && player.rpm < 70) {
-                accel = 1.5; // Зеленая зона тахометра
-            } else if (player.rpm >= 70) {
-                accel = 0.2; // Красная зона (перегрев)
+            // ========== ИСПРАВЛЕННАЯ ФИЗИКА ==========
+
+            // Базовое ускорение зависит от зоны тахометра
+            double accel;
+            if (player.rpm < 30) {
+                accel = 0.3; // Синяя зона - слабое ускорение
+            } else if (player.rpm < 70) {
+                accel = 2.0; // Зелёная зона - сильное ускорение
+            } else if (player.rpm < 90) {
+                accel = 1.0; // Жёлтая зона - среднее ускорение
+            } else {
+                accel = 0.1; // Красная зона - очень слабое (перегрев)
             }
 
+            // Скорость растёт
             player.speed += accel;
+
+            // Дистанция растёт пропорционально скорости
             player.distance += player.speed / 10.0;
-            player.rpm = Math.min(100, (player.speed / (player.gear * 20.0)) * 100);
+
+            // ========== ИСПРАВЛЕННЫЙ РАСЧЁТ RPM ==========
+            // Чем выше передача, тем медленнее растут обороты
+            // gear=1: rpm растёт быстро
+            // gear=4: rpm растёт медленно
+            double rpmGrowth = player.speed / (player.gear * 50.0) * 100;
+            player.rpm = Math.min(MAX_RPM, rpmGrowth);
+
+            // Проверка взрыва двигателя
+            if (player.rpm >= ENGINE_EXPLODE_RPM) {
+                player.explodeTime++;
+                if (player.explodeTime > 30) {
+                    player.isAlive = false;
+                    player.deathReason = "ENGINE_EXPLOSION";
+                }
+            } else {
+                player.explodeTime = 0;
+            }
 
             // Проверка столкновений с трассой
             for (TrackEvent event : track) {
@@ -82,7 +162,8 @@ public class GameRoom {
                         if (event.type() == TrackEvent.EventType.OBSTACLE ||
                                 event.type() == TrackEvent.EventType.POTHOLE ||
                                 event.type() == TrackEvent.EventType.SHIELD_OBSTACLE) {
-                            player.isAlive = false; // ВЗРЫВ!
+                            player.isAlive = false;
+                            player.deathReason = "COLLISION";
                         }
                     }
                 }
@@ -93,53 +174,128 @@ public class GameRoom {
                 if (rocket.getLane() == player.lane &&
                         Math.abs(rocket.getDistance() - player.distance) < 20) {
                     if (!player.hasShield) {
-                        player.isAlive = false; // ВЗРЫВ!
+                        player.isAlive = false;
+                        player.deathReason = "ROCKET_HIT";
                     } else {
-                        player.hasShield = false; // Щит поглощает урон
+                        player.hasShield = false;
                     }
                 }
             }
+
+            // Проверка финиша
+            if (player.distance >= 5000 && !player.finished) {
+                player.finished = true;
+                player.finishTime = currentTick.get();
+                player.finishPosition = getFinishPosition(player);
+            }
+        }
+
+        // Проверка окончания гонки
+        long aliveCount = players.values().stream().filter(p -> p.isAlive).count();
+        long finishedCount = players.values().stream().filter(p -> p.finished).count();
+
+        if (aliveCount == 0 || finishedCount == players.size()) {
+            phase = GamePhase.FINISHED;
+            if (gameLoop != null) gameLoop.dispose();
+            broadcastRaceState();
         }
     }
 
-    private void broadcastState() {
+    private int getFinishPosition(PlayerState player) {
+        long finishedBefore = players.values().stream()
+                .filter(p -> p.finished && p.finishTime < player.finishTime)
+                .count();
+        return (int) finishedBefore + 1;
+    }
+
+    private void broadcastLobbyState() {
         try {
-            // Берем первого живого игрока для расчета upcoming events
-            PlayerState referencePlayer = players.values().stream()
-                    .filter(p -> p.isAlive)
-                    .findFirst()
-                    .orElse(players.values().iterator().next());
-
             Map<String, Object> state = new HashMap<>();
-            state.put("type", "GAME_STATE");
-            state.put("tick", currentTick.get());
+            state.put("type", "LOBBY_STATE");
+            state.put("roomId", roomId);
+            state.put("phase", phase.name());
+            state.put("creatorId", creatorId);
 
-            // Состояние всех игроков
             List<Map<String, Object>> playersData = players.values().stream()
                     .map(p -> {
                         Map<String, Object> pData = new HashMap<>();
                         pData.put("id", p.playerId);
-                        pData.put("lane", p.lane);
-                        pData.put("speed", (int) p.speed);
-                        pData.put("distance", (int) p.distance);
-                        pData.put("rpm", (int) p.rpm);
-                        pData.put("gear", p.gear);
-                        pData.put("alive", p.isAlive);
-                        pData.put("hasShield", p.hasShield);
+                        pData.put("login", p.login);
+                        pData.put("ready", p.isReady);
                         return pData;
                     })
                     .toList();
             state.put("players", playersData);
 
-            // Предстоящие события (для HUD)
-            List<TrackEvent> upcoming = track.stream()
-                    .filter(e -> e.distance() > referencePlayer.distance &&
-                            e.distance() < referencePlayer.distance + 300)
-                    .limit(5)
-                    .toList();
-            state.put("upcomingEvents", upcoming);
+            String json = mapper.writeValueAsString(state);
+            lastLobbyState = json;
+            broadcastSink.tryEmitNext(json);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
 
-            // Ракеты
+    private void broadcastCountdown() {
+        try {
+            Map<String, Object> state = new HashMap<>();
+            state.put("type", "COUNTDOWN");
+            state.put("countdown", countdown);
+            broadcastSink.tryEmitNext(mapper.writeValueAsString(state));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void broadcastRaceState() {
+        try {
+            List<PlayerState> sortedPlayers = players.values().stream()
+                    .sorted((a, b) -> Double.compare(b.distance, a.distance))
+                    .toList();
+
+            Map<String, Object> state = new HashMap<>();
+            state.put("type", "RACE_STATE");
+            state.put("tick", currentTick.get());
+            state.put("phase", phase.name());
+
+            List<Map<String, Object>> leaderboard = new ArrayList<>();
+            for (int i = 0; i < sortedPlayers.size(); i++) {
+                PlayerState p = sortedPlayers.get(i);
+                Map<String, Object> pData = new HashMap<>();
+                pData.put("position", i + 1);
+                pData.put("id", p.playerId);
+                pData.put("login", p.login);
+                pData.put("lane", p.lane);
+                pData.put("speed", (int) p.speed);
+                pData.put("distance", (int) p.distance);
+                pData.put("rpm", (int) p.rpm);
+                pData.put("gear", p.gear);
+                pData.put("alive", p.isAlive);
+                pData.put("hasShield", p.hasShield);
+                pData.put("finished", p.finished);
+                pData.put("finishPosition", p.finishPosition);
+                leaderboard.add(pData);
+            }
+            state.put("leaderboard", leaderboard);
+
+            // ========== ИСПРАВЛЕНО: препятствия для каждого игрока ==========
+            Map<String, List<Map<String, Object>>> hazardsByPlayer = new HashMap<>();
+            for (PlayerState p : players.values()) {
+                List<Map<String, Object>> list = new ArrayList<>();
+                for (TrackEvent e : track) {
+                    int delta = e.distance() - (int) p.distance;
+                    if (delta > 0 && delta < 400) {
+                        Map<String, Object> hazard = new HashMap<>();
+                        hazard.put("distance", e.distance());
+                        hazard.put("delta", delta);
+                        hazard.put("lane", e.lane());
+                        hazard.put("type", e.type().name());
+                        list.add(hazard);
+                    }
+                }
+                hazardsByPlayer.put(p.playerId, list);
+            }
+            state.put("hazardsByPlayer", hazardsByPlayer);
+
             List<Map<String, Object>> rocketsData = rockets.stream()
                     .map(r -> {
                         Map<String, Object> rData = new HashMap<>();
@@ -151,33 +307,58 @@ public class GameRoom {
                     .toList();
             state.put("rockets", rocketsData);
 
+            List<Map<String, Object>> overtakeEvents = detectOvertakes(sortedPlayers);
+            state.put("overtakes", overtakeEvents);
+
             broadcastSink.tryEmitNext(mapper.writeValueAsString(state));
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
+    private List<Map<String, Object>> detectOvertakes(List<PlayerState> sortedPlayers) {
+        List<Map<String, Object>> overtakes = new ArrayList<>();
+
+        for (PlayerState player : sortedPlayers) {
+            int currentPosition = sortedPlayers.indexOf(player);
+
+            if (player.lastPosition != -1 && currentPosition < player.lastPosition) {
+                Map<String, Object> overtake = new HashMap<>();
+                overtake.put("playerId", player.playerId);
+                overtake.put("overtakenPosition", player.lastPosition + 1);
+                overtake.put("newPosition", currentPosition + 1);
+                overtakes.add(overtake);
+            }
+
+            player.lastPosition = currentPosition;
+        }
+
+        return overtakes;
+    }
+
     public void handleInput(String playerId, String action) {
         PlayerState player = players.get(playerId);
-        if (player == null || !player.isAlive) return;
+        if (player == null || !player.isAlive || phase != GamePhase.RACING) return;
 
         long currentTime = System.currentTimeMillis();
 
         switch (action) {
             case "MOVE_LEFT" -> {
-                if (currentTime - player.lastMoveTime > 100) {
+                // ========== ИСПРАВЛЕНО: кулдаун 50 мс (быстрее реакция) ==========
+                if (currentTime - player.lastMoveTime > 50) {
                     player.lane = Math.max(0, player.lane - 1);
                     player.lastMoveTime = currentTime;
                 }
             }
             case "MOVE_RIGHT" -> {
-                if (currentTime - player.lastMoveTime > 100) {
+                if (currentTime - player.lastMoveTime > 50) {
                     player.lane = Math.min(3, player.lane + 1);
                     player.lastMoveTime = currentTime;
                 }
             }
             case "SHIFT_GEAR" -> {
-                if (currentTime - player.lastGearShift > 1000) {
+                // ========== ИСПРАВЛЕНО: кулдаун 300 мс (быстрее переключение) ==========
+                if (currentTime - player.lastGearShift > 300) {
                     player.gear = (player.gear % 4) + 1;
                     player.lastGearShift = currentTime;
                 }
@@ -185,8 +366,7 @@ public class GameRoom {
             case "DROP_SHIELD" -> {
                 if (player.hasShield) {
                     player.hasShield = false;
-                    player.speed += 10; // Бонус к скорости
-                    // Спавним щит как препятствие
+                    player.speed += 10;
                     track.add(new TrackEvent(
                             (int) player.distance + 50,
                             player.lane,
@@ -201,10 +381,6 @@ public class GameRoom {
                 }
             }
         }
-    }
-
-    public boolean isFull() {
-        return players.size() >= 4;
     }
 
     public Flux<String> getGameStream() {

@@ -1,19 +1,20 @@
 package ru.make.alex.brutal.racing.websocket;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.socket.WebSocketHandler;
 import org.springframework.web.reactive.socket.WebSocketSession;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import ru.make.alex.brutal.racing.engine.GameRoom;
 import ru.make.alex.brutal.racing.security.JwtService;
 import ru.make.alex.brutal.racing.service.RoomManager;
 
-import java.util.UUID;
+import java.util.Objects;
 
 @Component
 public class GameWebSocketHandler implements WebSocketHandler {
+
     private final RoomManager roomManager;
     private final JwtService jwtService;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -25,46 +26,73 @@ public class GameWebSocketHandler implements WebSocketHandler {
 
     @Override
     public Mono<Void> handle(WebSocketSession session) {
-        // 1. Читаем токен из query parameter
         String query = session.getHandshakeInfo().getUri().getQuery();
-        String token = extractTokenFromQuery(query);
+        String token = extractParam(query, "token");
+        String roomId = extractParam(query, "roomId");
+        String login = extractParam(query, "login"); // <-- ИЗВЛЕКАЕМ LOGIN
 
-        if (token == null || token.isEmpty()) {
-            System.out.println("WebSocket connection rejected: No token in query parameter");
+        if (token == null || roomId == null || login == null) {
+            System.out.println("WebSocket connection rejected: Missing token, roomId or login");
             return session.close();
         }
 
-        // 2. Валидируем токен
         String playerId = jwtService.validateTokenAndGetPlayerId(token);
         if (playerId == null) {
             System.out.println("WebSocket connection rejected: Invalid token");
             return session.close();
         }
 
-        System.out.println("Player " + playerId + " authenticated and connected via query param.");
+        var room = roomManager.getRoom(roomId);
+        if (room == null) {
+            System.out.println("WebSocket connection rejected: Room not found");
+            return session.close();
+        }
 
-        // 3. Получаем или создаем комнату
-        GameRoom room = roomManager.getOrCreateRoom(UUID.randomUUID().toString());
-        room.addPlayer(playerId);
-        room.startGame();
+        System.out.println("Player " + login + " (" + playerId + ") joined room " + roomId);
+        room.addPlayer(playerId, login); // <-- ПЕРЕДАЁМ LOGIN
 
-        // 4. Отправка данных клиенту (Game Loop)
-        Mono<Void> output = session.send(room.getGameStream().map(session::textMessage));
+        // Отправляем текущее состояние лобби новому игроку СРАЗУ
+        Mono<Void> initialState = session.send(
+                Flux.just(session.textMessage(room.getLastLobbyState()))
+        );
 
-        // 5. Получение и обработка инпутов от клиента
+        // Затем поток из gameStream
+        Mono<Void> output = session.send(
+                Flux.concat(
+                        Flux.just(session.textMessage(room.getLastLobbyState())),
+                        room.getGameStream().map(session::textMessage)
+                )
+        );
+
         Mono<Void> input = session.receive()
                 .map(msg -> {
                     try {
-                        JsonNode node = mapper.readTree(msg.getPayloadAsText());
-                        return node.get("action").asText();
+                        return mapper.readTree(msg.getPayloadAsText());
                     } catch (Exception e) {
                         return null;
                     }
                 })
-                .filter(action -> action != null)
-                .doOnNext(action -> room.handleInput(playerId, action))
+                .filter(Objects::nonNull)
+                .doOnNext(node -> {
+                    String type = node.has("type") ? node.get("type").asText() : "";
+
+                    if ("READY".equals(type)) {
+                        boolean ready = node.get("ready").asBoolean();
+                        room.setPlayerReady(playerId, ready);
+                    } else if ("START".equals(type)) {
+                        if (playerId.equals(room.getCreatorId())) {
+                            System.out.println("Start requested by creator " + playerId);
+                            room.startCountdown();
+                        } else {
+                            System.out.println("Start rejected: player " + playerId + " is not creator");
+                        }
+                    } else if ("ACTION".equals(type)) {
+                        String action = node.get("action").asText();
+                        room.handleInput(playerId, action);
+                    }
+                })
                 .doFinally(signal -> {
-                    System.out.println("Player " + playerId + " disconnected. EXPLODING!");
+                    System.out.println("Player " + playerId + " disconnected");
                     room.removePlayer(playerId);
                 })
                 .then();
@@ -72,16 +100,12 @@ public class GameWebSocketHandler implements WebSocketHandler {
         return Mono.zip(input, output).then();
     }
 
-    // Извлекаем токен из query string: "token=eyJhbGci..."
-    private String extractTokenFromQuery(String query) {
-        if (query == null || query.isEmpty()) {
-            return null;
-        }
-
+    private String extractParam(String query, String paramName) {
+        if (query == null || query.isEmpty()) return null;
         String[] params = query.split("&");
         for (String param : params) {
             String[] keyValue = param.split("=");
-            if (keyValue.length == 2 && "token".equals(keyValue[0])) {
+            if (keyValue.length == 2 && paramName.equals(keyValue[0])) {
                 return keyValue[1];
             }
         }
